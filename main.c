@@ -36,29 +36,20 @@ int main()
     SpringConfig *config = spring_config_default();
     assert_not_null(config);
 
-    // Create a pipeline (dataflow definition in SpringQL).
     SpringPipeline *pipeline = spring_open(config);
     assert_not_null(pipeline);
 
-    // Create a source stream. A stream is similar to a table in relational database.
-    // A source stream is a stream to fetch stream data from a foreign source.
-    //
-    // `ROWTIME` is a keyword to declare that the column represents the event time of a row.
     ret = spring_command(
         pipeline,
-        "CREATE SOURCE STREAM source_temperature_celsius ("
-        "    ts TIMESTAMP NOT NULL ROWTIME,"
-        "    temperature FLOAT NOT NULL"
+        "CREATE SOURCE STREAM source_1 ("
+        "    b BLOB NOT NULL"
         ");");
     assert_ok(ret);
 
-    // Create a sink stream.
-    // A sink stream is a final stream in a pipeline. A foreign sink fetches stream rows from it.
     ret = spring_command(
         pipeline,
-        "CREATE SINK STREAM sink_temperature_fahrenheit ("
-        "    ts TIMESTAMP NOT NULL ROWTIME,"
-        "    temperature FLOAT NOT NULL"
+        "CREATE SINK STREAM sink_1 ("
+        "    b BLOB NOT NULL"
         ");");
     assert_ok(ret);
 
@@ -67,11 +58,10 @@ int main()
     ret = spring_command(
         pipeline,
         "CREATE PUMP c_to_f AS"
-        "    INSERT INTO sink_temperature_fahrenheit (ts, temperature)"
+        "    INSERT INTO sink_1 (b)"
         "    SELECT STREAM"
-        "       source_temperature_celsius.ts,"
-        "       32.0 + source_temperature_celsius.temperature * 1.8"
-        "    FROM source_temperature_celsius;");
+        "       source_1.b"
+        "    FROM source_1;");
     assert_ok(ret);
 
     // Create a sink writer as an in-memory queue.
@@ -79,9 +69,9 @@ int main()
     // Here we use an in-memory queue as the foreign sinks to easily get rows from our program written here.
     ret = spring_command(
         pipeline,
-        "CREATE SINK WRITER queue_temperature_fahrenheit FOR sink_temperature_fahrenheit"
+        "CREATE SINK WRITER queue_sink FOR sink_1"
         "    TYPE IN_MEMORY_QUEUE OPTIONS ("
-        "        NAME 'q'"
+        "        NAME 'q_sink'"
         "    );");
     assert_ok(ret);
 
@@ -91,37 +81,49 @@ int main()
     // Dataflow starts soon after this command creates the source reader instance.
     ret = spring_command(
         pipeline,
-        "CREATE SOURCE READER tcp_trade FOR source_temperature_celsius"
-        "    TYPE NET_SERVER OPTIONS ("
-        "        PROTOCOL 'TCP',"
-        "        PORT '9876'"
+        "CREATE SOURCE READER q_src FOR source_1"
+        "    TYPE IN_MEMORY_QUEUE OPTIONS ("
+        "        NAME 'q_src'"
         "    );");
     assert_ok(ret);
 
+    const int n_rows = 10;
+
+    // push rows
+    for (int i = 0; i < n_rows; ++i)
+    {
+        SpringSourceRowBuilder *builder = spring_source_row_builder();
+
+        int b = 0x12345678 + i;
+        spring_source_row_add_column_blob(builder, "b", &b, sizeof(int));
+
+        SpringSourceRow *row = spring_source_row_build(builder);
+        spring_push(pipeline, "q_src", row);
+
+        spring_source_row_close(row);
+    }
+
     SpringSinkRow *row;
-    while (1)
+    for (int i = 0; i < n_rows; ++i)
     {
         // Get a row,
-        row = spring_pop(pipeline, "q");
+        row = spring_pop(pipeline, "q_sink");
         assert_not_null(row);
 
         // fetch columns,
-        const int ts_len = 128;
-        const char ts[ts_len];
-
-        int r = spring_column_text(row, 0, (char *)ts, ts_len);
-        assert(r == strlen(ts));
-
-        float temperature_fahrenheit;
-        ret = spring_column_float(row, 1, &temperature_fahrenheit);
-        assert_ok(ret);
+        int b;
+        int r = spring_column_blob(row, 0, &b, sizeof(int));
+        assert(r == sizeof(int));
 
         // and print them.
-        fprintf(stderr, "%s\t%f\n", ts, temperature_fahrenheit);
+        fprintf(stderr, "%x\n", b);
 
         // Free the row
         spring_sink_row_close(row);
     }
+
+    fprintf(stderr, "waiting for more rows (never comes)...\n");
+    row = spring_pop(pipeline, "q_sink");
 
     // Free the remaining resources
     ret = spring_close(pipeline);
